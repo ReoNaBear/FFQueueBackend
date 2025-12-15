@@ -1,0 +1,271 @@
+import express from "express";
+import { createServer } from "http";
+import { WebSocketServer } from "ws";
+import Redis from "ioredis";
+import fetch from "node-fetch"; 
+import cors from "cors";
+import dotenv from "dotenv"; // 建議安裝: npm install dotenv
+
+dotenv.config(); // 讀取 .env 檔案
+
+const app = express();
+app.use(cors());
+app.use(express.json()); // ★★★ 必須加入這行，才能讀取 POST 的 body ★★★
+
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+// 建議改用環境變數，若沒有則使用預設值
+const REDIS_URL = process.env.REDIS_URL
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD // 後台密碼
+
+const redis = new Redis(REDIS_URL);
+
+const KEYS = {
+  PRODUCTS: "queue:products",
+  GLOBAL: "queue:global",
+  CLIENT_PREFIX: "queue:client:",
+  SELECTIONS: "queue:selections"
+};
+
+// --------------------
+// ★★★ 新增：後台登入 API ★★★
+// --------------------
+app.post("/api/admin-login", (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASSWORD) {
+    res.json({ success: true, message: "登入成功" });
+  } else {
+    res.status(401).json({ success: false, message: "密碼錯誤" });
+  }
+});
+
+// --------------------
+// WebSocket 邏輯
+// --------------------
+function heartbeat() { this.isAlive = true; }
+
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+
+  ws.on("message", async (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      const clientId = data.clientId;
+      if (!clientId && data.action !== "getInitialData") return;
+
+      switch (data.action) {
+        case "joinQueue":
+          await handleJoinQueue(ws, clientId);
+          break;
+        case "redrawTicket":
+          await handleRedrawTicket(ws, clientId);
+          break;
+        case "updateCart":
+          const cartRaw = JSON.stringify(data.cart || {});
+          const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
+          await redis.hset(clientKey, "cart", cartRaw);
+          await redis.expire(clientKey, 86400); // ★★★ 延長壽命 24h
+          break;
+        case "submitSelection":
+          await handleSubmitSelection(clientId);
+          break;
+        case "getInitialData":
+          await sendInitialData(ws, clientId);
+          break;
+        case "adminUpdateProducts":
+          await redis.set(KEYS.PRODUCTS, JSON.stringify(data.products));
+          broadcast({ type: "productsUpdate", products: data.products });
+          break;
+        case "adminNext":
+          const current = await redis.hincrby(KEYS.GLOBAL, "currentNumber", 1);
+          broadcast({ type: "nextUpdate", current });
+          break;
+        case "adminCheckout":
+          await handleCheckout(data.checkoutItems);
+          break;
+        default:
+          console.log("未知指令:", data.action);
+      }
+    } catch (e) {
+      console.error("Error:", e);
+    }
+  });
+});
+
+// --------------------
+// 邏輯處理函數
+// --------------------
+
+async function handleJoinQueue(ws, clientId) {
+  const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
+  let userData = await redis.hgetall(clientKey);
+  let myNumber, myCart = {}, isSubmitted = false;
+
+  if (userData && userData.number) {
+    myNumber = Number(userData.number);
+    myCart = userData.cart ? JSON.parse(userData.cart) : {};
+    isSubmitted = userData.isSubmitted === "1";
+  } else {
+    myNumber = await redis.hincrby(KEYS.GLOBAL, "totalCount", 1);
+    await redis.hset(clientKey, {
+      number: myNumber,
+      cart: "{}",
+      isSubmitted: "0",
+      joinedAt: Date.now()
+    });
+    await redis.expire(clientKey, 86400); // ★★★ 設定 24小時後自動刪除
+    broadcastQueueCount();
+  }
+
+  ws.send(JSON.stringify({ type: "joinResult", myNumber, myCart, isSubmitted }));
+}
+
+async function handleRedrawTicket(ws, clientId) {
+  const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
+  const oldNumber = await redis.hget(clientKey, "number");
+  if (oldNumber) await redis.hdel(KEYS.SELECTIONS, oldNumber);
+
+  const newNumber = await redis.hincrby(KEYS.GLOBAL, "totalCount", 1);
+  await redis.hset(clientKey, { number: newNumber, cart: "{}", isSubmitted: "0", updatedAt: Date.now() });
+  await redis.expire(clientKey, 86400); // ★★★ 延長壽命
+  
+  broadcastQueueCount();
+  ws.send(JSON.stringify({ type: "joinResult", myNumber: newNumber, myCart: {}, isSubmitted: false }));
+}
+
+async function handleSubmitSelection(clientId) {
+  const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
+  const userData = await redis.hgetall(clientKey);
+
+  if (userData && userData.number) {
+    await redis.hset(clientKey, "isSubmitted", "1");
+    if (userData.cart) {
+      await redis.hset(KEYS.SELECTIONS, userData.number, userData.cart);
+    }
+    // ★★★ 修正：讀取並解析所有選擇 ★★★
+    const allSelections = await getParsedSelections();
+    broadcast({ type: "selectionUpdate", selections: allSelections });
+  }
+}
+
+async function sendInitialData(ws, clientId) {
+  const [productsRaw, globalData] = await Promise.all([
+    redis.get(KEYS.PRODUCTS),
+    redis.hgetall(KEYS.GLOBAL)
+  ]);
+  
+  // ★★★ 修正：讀取並解析所有選擇 ★★★
+  const allSelections = await getParsedSelections();
+
+  const products = productsRaw ? JSON.parse(productsRaw) : [];
+  const queueCount = Number(globalData?.totalCount || 0);
+  const currentNumber = Number(globalData?.currentNumber || 0);
+
+  let myState = null;
+  if (clientId) {
+      const userData = await redis.hgetall(`${KEYS.CLIENT_PREFIX}${clientId}`);
+      if (userData && userData.number) {
+          myState = {
+              myNumber: Number(userData.number),
+              myCart: userData.cart ? JSON.parse(userData.cart) : {},
+              isSubmitted: userData.isSubmitted === "1"
+          };
+      }
+  }
+
+  ws.send(JSON.stringify({
+    type: "initialData",
+    products,
+    queueCount,
+    currentNumber,
+    clientSelections: allSelections, 
+    myState 
+  }));
+}
+
+// ★★★ 輔助函數：解析 Redis Hash 中的 JSON 字串 ★★★
+async function getParsedSelections() {
+  const raw = await redis.hgetall(KEYS.SELECTIONS);
+  const parsed = {};
+  for (const [key, value] of Object.entries(raw)) {
+    try {
+      parsed[key] = JSON.parse(value);
+    } catch (e) {
+      parsed[key] = {};
+    }
+  }
+  return parsed;
+}
+
+async function handleCheckout(checkoutItems) {
+  const productsRaw = await redis.get(KEYS.PRODUCTS);
+  let products = productsRaw ? JSON.parse(productsRaw) : [];
+  let isUpdated = false;
+
+  checkoutItems.forEach(item => {
+    const target = products.find(p => p.id === item.id);
+    if (target && item.checkoutQty > 0) {
+      target.qty = Math.max(0, target.qty - item.checkoutQty);
+      isUpdated = true;
+    }
+  });
+
+  if (isUpdated) {
+    await redis.set(KEYS.PRODUCTS, JSON.stringify(products));
+    broadcast({ type: "productsUpdate", products });
+  }
+}
+
+async function broadcastQueueCount() {
+  const count = await redis.hget(KEYS.GLOBAL, "totalCount");
+  broadcast({ type: "queueUpdate", queueCount: Number(count) });
+}
+
+function broadcast(obj) {
+  const msg = JSON.stringify(obj);
+  wss.clients.forEach((client) => {
+    if (client.readyState === client.OPEN) client.send(msg);
+  });
+}
+
+// --------------------
+// 伺服器保活機制 (Keep-Alive)
+// --------------------
+
+// 1. WebSocket 心跳檢測 (每 30 秒移除斷線者)
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on("close", () => {
+  clearInterval(interval);
+});
+
+// 2. Render 免費方案自我 Ping (防止休眠)
+// 請在 Render 環境變數設定 RENDER_EXTERNAL_URL
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "http://localhost:3000"; 
+setInterval(async () => {
+    try {
+        // 這裡只是一個簡單的請求，確保 Server 有在動
+        // 建議在 express 加一個簡單的 router
+        await fetch(RENDER_URL); 
+        console.log("Keep-Alive ping sent.");
+    } catch (err) {
+        // 忽略錯誤，可能是還沒啟動或網路問題
+    }
+}, 14 * 60 * 1000); // 每 14 分鐘 ping 一次 (Render 休眠時間約 15 分鐘)
+
+// Express 簡單路由 (給 Ping 用)
+app.get("/", (req, res) => {
+    res.send("Server is running...");
+});
+
+// 啟動 Server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
