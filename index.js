@@ -53,7 +53,7 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(msg);
       const clientId = data.clientId;
-      if (!clientId && data.action !== "getInitialData") return;
+      if (!clientId) return;
 
       switch (data.action) {
         case "joinQueue":
@@ -69,21 +69,27 @@ wss.on("connection", (ws) => {
           await redis.expire(clientKey, 86400); // ★★★ 延長壽命 24h
           break;
         case "submitSelection":
-          await handleSubmitSelection(clientId);
+          await handleSubmitSelection(ws, clientId);
           break;
         case "getInitialData":
           await sendInitialData(ws, clientId);
           break;
         case "adminUpdateProducts":
+          console.log("收到更新商品請求:", data.products.length, "筆資料");
           await redis.set(KEYS.PRODUCTS, JSON.stringify(data.products));
           broadcast({ type: "productsUpdate", products: data.products });
           break;
         case "adminNext":
+          // 確保即使沒有值也能從 1 開始
           const current = await redis.hincrby(KEYS.GLOBAL, "currentNumber", 1);
+          console.log("叫號更新:", current);
           broadcast({ type: "nextUpdate", current });
           break;
         case "adminCheckout":
           await handleCheckout(data.checkoutItems);
+          break;
+        case "submitSelection":
+          await handleSubmitSelection(ws, clientId);
           break;
         default:
           console.log("未知指令:", data.action);
@@ -100,14 +106,25 @@ wss.on("connection", (ws) => {
 
 async function handleJoinQueue(ws, clientId) {
   const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
-  let userData = await redis.hgetall(clientKey);
+  const [userData, currentNumberStr] = await Promise.all([
+    redis.hgetall(clientKey),
+    redis.hget(KEYS.GLOBAL, "currentNumber")
+  ]);
+  const currentNumber = Number(currentNumberStr || 0);
+let needNewTicket = true;
   let myNumber, myCart = {}, isSubmitted = false;
 
   if (userData && userData.number) {
-    myNumber = Number(userData.number);
-    myCart = userData.cart ? JSON.parse(userData.cart) : {};
-    isSubmitted = userData.isSubmitted === "1";
-  } else {
+    const oldNumber = Number(userData.number);
+
+    if (oldNumber >= currentNumber) {
+      myNumber = oldNumber;
+      myCart = userData.cart ? JSON.parse(userData.cart) : {};
+      isSubmitted = userData.isSubmitted === "1";
+      needNewTicket = false; // 不需要新號碼
+    }
+  } 
+  if (needNewTicket) {
     myNumber = await redis.hincrby(KEYS.GLOBAL, "totalCount", 1);
     await redis.hset(clientKey, {
       number: myNumber,
@@ -135,7 +152,7 @@ async function handleRedrawTicket(ws, clientId) {
   ws.send(JSON.stringify({ type: "joinResult", myNumber: newNumber, myCart: {}, isSubmitted: false }));
 }
 
-async function handleSubmitSelection(clientId) {
+async function handleSubmitSelection(ws, clientId) { // ★★★ 接收 ws 參數
   const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
   const userData = await redis.hgetall(clientKey);
 
@@ -144,9 +161,19 @@ async function handleSubmitSelection(clientId) {
     if (userData.cart) {
       await redis.hset(KEYS.SELECTIONS, userData.number, userData.cart);
     }
-    // ★★★ 修正：讀取並解析所有選擇 ★★★
+    
+    // 廣播給所有人更新清單
     const allSelections = await getParsedSelections();
     broadcast({ type: "selectionUpdate", selections: allSelections });
+
+    // ★★★ 新增：發送「操作成功」給該使用者 ★★★
+    if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ 
+            type: "actionSuccess", 
+            action: "submitSelection", // 標記是哪個動作成功了
+            message: "預選清單已成功送達伺服器！" 
+        }));
+    }
   }
 }
 
