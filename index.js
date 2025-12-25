@@ -25,7 +25,8 @@ const KEYS = {
   PRODUCTS: "queue:products",
   GLOBAL: "queue:global",
   CLIENT_PREFIX: "queue:client:",
-  SELECTIONS: "queue:selections"
+  SELECTIONS: "queue:selections",
+  SETTINGS: "queue:settings"
 };
 
 // --------------------
@@ -56,6 +57,12 @@ wss.on("connection", (ws) => {
       if (!clientId) return;
 
       switch (data.action) {
+        case "adminSetSettings":
+          await handleSetSettings(data.settings);
+          break;
+        case "adminResetQueue":
+          await handleResetQueue();
+          break;
         case "joinQueue":
           await handleJoinQueue(ws, clientId);
           break;
@@ -103,15 +110,62 @@ wss.on("connection", (ws) => {
 // --------------------
 // 邏輯處理函數
 // --------------------
+// 時間處理設定變更
+async function handleSetSettings(settings) {
+    // 儲存設定到 Redis
+    await redis.set(KEYS.SETTINGS, JSON.stringify(settings));
+    // 廣播給所有人更新設定 (Client 端需要知道時間變了)
+    broadcast({ type: "settingsUpdate", settings });
+}
+
+// 處理重置隊伍
+async function handleResetQueue() {
+    // 1. 清除全域計數器
+    await redis.del(KEYS.GLOBAL);
+    
+    // 2. 清除所有預選單
+    await redis.del(KEYS.SELECTIONS);
+
+    // 3. 清除所有 Client 資料 (比較暴力的做法，但最乾淨)
+    // 取得所有 client key
+    const clientKeys = await redis.keys(`${KEYS.CLIENT_PREFIX}*`);
+    if (clientKeys.length > 0) {
+        await redis.del(...clientKeys);
+    }
+
+    // 4. 廣播「重置」訊號，叫所有前端清空自己
+    broadcast({ type: "forceReset" });
+    
+    // 5. 廣播最新的隊伍狀態 (歸零)
+    broadcast({ type: "queueUpdate", queueCount: 0 });
+    broadcast({ type: "nextUpdate", current: 0 });
+}
 
 async function handleJoinQueue(ws, clientId) {
+  const settingsRaw = await redis.get(KEYS.SETTINGS);
+  const settings = settingsRaw ? JSON.parse(settingsRaw) : {};
+  
+  // 檢查是否已到開始時間
+  if (settings.startTime) {
+      const now = Date.now();
+      const start = new Date(settings.startTime).getTime();
+      if (now < start) {
+          // 時間未到，回傳錯誤或特定狀態
+          ws.send(JSON.stringify({ 
+              type: "error", 
+              message: "活動尚未開始，請稍候！" 
+          }));
+          return;
+      }
+  }
+
   const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
   const [userData, currentNumberStr] = await Promise.all([
     redis.hgetall(clientKey),
     redis.hget(KEYS.GLOBAL, "currentNumber")
   ]);
   const currentNumber = Number(currentNumberStr || 0);
-let needNewTicket = true;
+  let needNewTicket = true;
   let myNumber, myCart = {}, isSubmitted = false;
 
   if (userData && userData.number) {
@@ -178,12 +232,13 @@ async function handleSubmitSelection(ws, clientId) { // ★★★ 接收 ws 參�
 }
 
 async function sendInitialData(ws, clientId) {
-  const [productsRaw, globalData] = await Promise.all([
+  const [productsRaw, globalData, settingsRaw] = await Promise.all([
     redis.get(KEYS.PRODUCTS),
-    redis.hgetall(KEYS.GLOBAL)
+    redis.hgetall(KEYS.GLOBAL),
+    redis.get(KEYS.SETTINGS)
   ]);
   
-  // ★★★ 修正：讀取並解析所有選擇 ★★★
+  const settings = settingsRaw ? JSON.parse(settingsRaw) : {};
   const allSelections = await getParsedSelections();
 
   const products = productsRaw ? JSON.parse(productsRaw) : [];
@@ -208,7 +263,8 @@ async function sendInitialData(ws, clientId) {
     queueCount,
     currentNumber,
     clientSelections: allSelections, 
-    myState 
+    myState,
+    settings
   }));
 }
 
