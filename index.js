@@ -289,9 +289,40 @@ async function handleCheckout(checkoutItems) {
 
   checkoutItems.forEach(item => {
     const target = products.find(p => p.id === item.id);
-    if (target && item.checkoutQty > 0) {
-      target.qty = Math.max(0, target.qty - item.checkoutQty);
-      isUpdated = true;
+    
+    // 基本檢查：庫存夠才能買
+    if (target && item.checkoutQty > 0 && target.qty >= item.checkoutQty) {
+        
+        // 情境 A: 這是組合商品
+        if (target.content) {
+            // 1. 檢查所有原料夠不夠扣 (雙重保險)
+            let ingredientsEnough = true;
+            Object.entries(target.content).forEach(([subId, subQty]) => {
+                const subProduct = products.find(p => p.id === subId);
+                const required = item.checkoutQty * subQty;
+                if (!subProduct || subProduct.qty < required) {
+                    ingredientsEnough = false;
+                }
+            });
+
+            if (ingredientsEnough) {
+                // 2. 扣除組合包「自己」的庫存
+                target.qty = Math.max(0, target.qty - item.checkoutQty);
+
+                // 3. 扣除「原料」的庫存
+                Object.entries(target.content).forEach(([subId, subQty]) => {
+                    const subProduct = products.find(p => p.id === subId);
+                    const deductAmount = item.checkoutQty * subQty;
+                    subProduct.qty = Math.max(0, subProduct.qty - deductAmount);
+                });
+                isUpdated = true;
+            }
+        } 
+        // 情境 B: 普通商品
+        else {
+            target.qty = Math.max(0, target.qty - item.checkoutQty);
+            isUpdated = true;
+        }
     }
   });
 
