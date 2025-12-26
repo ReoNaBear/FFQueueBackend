@@ -298,7 +298,7 @@ async function handleCheckout(checkoutItems) {
             // 1. 檢查所有原料夠不夠扣 (雙重保險)
             let ingredientsEnough = true;
             Object.entries(target.content).forEach(([subId, subQty]) => {
-                const subProduct = products.find(p => p.id === subId);
+                const subProduct = products.find(p => p.id == subId);
                 const required = item.checkoutQty * subQty;
                 if (!subProduct || subProduct.qty < required) {
                     ingredientsEnough = false;
@@ -311,7 +311,7 @@ async function handleCheckout(checkoutItems) {
 
                 // 3. 扣除「原料」的庫存
                 Object.entries(target.content).forEach(([subId, subQty]) => {
-                    const subProduct = products.find(p => p.id === subId);
+                    const subProduct = products.find(p => p.id == subId);
                     const deductAmount = item.checkoutQty * subQty;
                     subProduct.qty = Math.max(0, subProduct.qty - deductAmount);
                 });
