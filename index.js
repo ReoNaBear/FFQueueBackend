@@ -75,9 +75,6 @@ wss.on("connection", (ws) => {
           await redis.hset(clientKey, "cart", cartRaw);
           await redis.expire(clientKey, 86400); // ★★★ 延長壽命 24h
           break;
-        case "submitSelection":
-          await handleSubmitSelection(ws, clientId);
-          break;
         case "getInitialData":
           await sendInitialData(ws, clientId);
           break;
@@ -96,7 +93,7 @@ wss.on("connection", (ws) => {
           await handleCheckout(data.checkoutItems);
           break;
         case "submitSelection":
-          await handleSubmitSelection(ws, clientId);
+          await handleSubmitSelection(ws, clientId, data.cart);
           break;
         default:
           console.log("未知指令:", data.action);
@@ -206,27 +203,37 @@ async function handleRedrawTicket(ws, clientId) {
   ws.send(JSON.stringify({ type: "joinResult", myNumber: newNumber, myCart: {}, isSubmitted: false }));
 }
 
-async function handleSubmitSelection(ws, clientId) { // ★★★ 接收 ws 參數
+async function handleSubmitSelection(ws, clientId, incomingCart) { // ★★★ 接收 ws 參數
   const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
   const userData = await redis.hgetall(clientKey);
 
   if (userData && userData.number) {
-    await redis.hset(clientKey, "isSubmitted", "1");
-    if (userData.cart) {
-      await redis.hset(KEYS.SELECTIONS, userData.number, userData.cart);
+    let cartToSave = "{}";
+    if (incomingCart) {
+        cartToSave = JSON.stringify(incomingCart);
+        // 順便更新 User 自己的紀錄，確保一致性
+        await redis.hset(clientKey, "cart", cartToSave);
+    } else if (userData.cart) {
+        cartToSave = userData.cart;
     }
+
+    // 更新狀態
+    await redis.hset(clientKey, "isSubmitted", "1");
+    
+    // 寫入 Selections (給 Admin 看的)
+    await redis.hset(KEYS.SELECTIONS, userData.number, cartToSave);
     
     // 廣播給所有人更新清單
     const allSelections = await getParsedSelections();
     broadcast({ type: "selectionUpdate", selections: allSelections });
 
-    // ★★★ 新增：發送「操作成功」給該使用者 ★★★
+    // 發送「操作成功」給該使用者
     if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ 
-            type: "actionSuccess", 
-            action: "submitSelection", // 標記是哪個動作成功了
-            message: "預選清單已成功送達伺服器！" 
-        }));
+      ws.send(JSON.stringify({ 
+        type: "actionSuccess", 
+        action: "submitSelection",
+        message: "預選清單已成功送達伺服器！" 
+      }));
     }
   }
 }
