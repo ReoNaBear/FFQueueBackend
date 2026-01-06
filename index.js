@@ -97,8 +97,12 @@ wss.on("connection", (ws) => {
         case "submitSelection":
           await handleSubmitSelection(ws, clientId, data.cart);
           break;
-          case "updateName":
+        case "updateName":
           await handleUpdateName(ws, clientId, data.name);
+          break;
+        case "getAdminNames":
+          const allNames = await redis.hgetall(KEYS.NAMES);
+          ws.send(JSON.stringify({ type: "adminNamesData", names: allNames }));
           break;
         case "getHistory":
           await sendHistoryData(ws);
@@ -156,14 +160,22 @@ async function handleUpdateName(ws, clientId, name) {
   const userData = await redis.hgetall(clientKey);
   
   if (userData && userData.number) {
-    // 存入 user 資料
+    // 1. 更新 Redis
     await redis.hset(clientKey, "name", name);
-    // 存入號碼對照表 (方便 Admin 快速查詢)
     await redis.hset(KEYS.NAMES, userData.number, name);
     
-    // 廣播給 Admin 更新名字顯示
-    const allNames = await redis.hgetall(KEYS.NAMES);
-    broadcast({ type: "namesUpdate", names: allNames });
+    // 2. 回傳給該使用者 (確認更新成功)
+    if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: "updateMyNameSuccess", name }));
+    }
+
+    // 3. 廣播給 Admin (只廣播這一筆變動，減少流量)
+    // 格式：{ type: "singleNameUpdate", number: "1", name: "小明" }
+    broadcast({ 
+        type: "singleNameUpdate", 
+        number: userData.number, 
+        name: name 
+    });
   }
 }
 
@@ -268,11 +280,10 @@ async function handleSubmitSelection(ws, clientId, incomingCart) { // ★★★ 
 }
 
 async function sendInitialData(ws, clientId) {
-  const [productsRaw, globalData, settingsRaw, allNames] = await Promise.all([
+  const [productsRaw, globalData, settingsRaw] = await Promise.all([
     redis.get(KEYS.PRODUCTS),
     redis.hgetall(KEYS.GLOBAL),
-    redis.get(KEYS.SETTINGS),
-    redis.hgetall(KEYS.NAMES) // ★ 讀取名字
+    redis.get(KEYS.SETTINGS)
   ]);
   
   const settings = settingsRaw ? JSON.parse(settingsRaw) : {};
@@ -300,8 +311,7 @@ async function sendInitialData(ws, clientId) {
     products,
     queueCount,
     currentNumber,
-    clientSelections: allSelections, 
-    clientNames: allNames,
+    clientSelections: allSelections,
     myState,
     settings
   }));
