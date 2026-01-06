@@ -26,7 +26,9 @@ const KEYS = {
   GLOBAL: "queue:global",
   CLIENT_PREFIX: "queue:client:",
   SELECTIONS: "queue:selections",
-  SETTINGS: "queue:settings"
+  SETTINGS: "queue:settings",
+  NAMES: "queue:names",
+  HISTORY: "queue:history"
 };
 
 // --------------------
@@ -90,10 +92,20 @@ wss.on("connection", (ws) => {
           broadcast({ type: "nextUpdate", current });
           break;
         case "adminCheckout":
-          await handleCheckout(data.checkoutItems);
+          await handleCheckout(data.checkoutItems, data.orderInfo);
           break;
         case "submitSelection":
           await handleSubmitSelection(ws, clientId, data.cart);
+          break;
+          case "updateName":
+          await handleUpdateName(ws, clientId, data.name);
+          break;
+        case "getHistory":
+          await sendHistoryData(ws);
+          break;
+        case "clearHistory":
+          await redis.del(KEYS.HISTORY);
+          ws.send(JSON.stringify({ type: "historyCleared" }));
           break;
         default:
           console.log("未知指令:", data.action);
@@ -122,6 +134,7 @@ async function handleResetQueue() {
     
     // 2. 清除所有預選單
     await redis.del(KEYS.SELECTIONS);
+    await redis.del(KEYS.NAMES);
 
     // 3. 清除所有 Client 資料 (比較暴力的做法，但最乾淨)
     // 取得所有 client key
@@ -136,6 +149,22 @@ async function handleResetQueue() {
     // 5. 廣播最新的隊伍狀態 (歸零)
     broadcast({ type: "queueUpdate", queueCount: 0 });
     broadcast({ type: "nextUpdate", current: 0 });
+}
+
+async function handleUpdateName(ws, clientId, name) {
+  const clientKey = `${KEYS.CLIENT_PREFIX}${clientId}`;
+  const userData = await redis.hgetall(clientKey);
+  
+  if (userData && userData.number) {
+    // 存入 user 資料
+    await redis.hset(clientKey, "name", name);
+    // 存入號碼對照表 (方便 Admin 快速查詢)
+    await redis.hset(KEYS.NAMES, userData.number, name);
+    
+    // 廣播給 Admin 更新名字顯示
+    const allNames = await redis.hgetall(KEYS.NAMES);
+    broadcast({ type: "namesUpdate", names: allNames });
+  }
 }
 
 async function handleJoinQueue(ws, clientId) {
@@ -239,10 +268,11 @@ async function handleSubmitSelection(ws, clientId, incomingCart) { // ★★★ 
 }
 
 async function sendInitialData(ws, clientId) {
-  const [productsRaw, globalData, settingsRaw] = await Promise.all([
+  const [productsRaw, globalData, settingsRaw, allNames] = await Promise.all([
     redis.get(KEYS.PRODUCTS),
     redis.hgetall(KEYS.GLOBAL),
-    redis.get(KEYS.SETTINGS)
+    redis.get(KEYS.SETTINGS),
+    redis.hgetall(KEYS.NAMES) // ★ 讀取名字
   ]);
   
   const settings = settingsRaw ? JSON.parse(settingsRaw) : {};
@@ -258,6 +288,7 @@ async function sendInitialData(ws, clientId) {
       if (userData && userData.number) {
           myState = {
               myNumber: Number(userData.number),
+              myName: userData.name || "",
               myCart: userData.cart ? JSON.parse(userData.cart) : {},
               isSubmitted: userData.isSubmitted === "1"
           };
@@ -270,9 +301,18 @@ async function sendInitialData(ws, clientId) {
     queueCount,
     currentNumber,
     clientSelections: allSelections, 
+    clientNames: allNames,
     myState,
     settings
   }));
+}
+
+// ★ 新增：傳送歷史資料
+async function sendHistoryData(ws) {
+  // lrange 0 -1 取出全部
+  const historyRaw = await redis.lrange(KEYS.HISTORY, 0, -1);
+  const history = historyRaw.map(item => JSON.parse(item));
+  ws.send(JSON.stringify({ type: "historyData", history }));
 }
 
 // ★★★ 輔助函數：解析 Redis Hash 中的 JSON 字串 ★★★
@@ -336,6 +376,18 @@ async function handleCheckout(checkoutItems) {
   if (isUpdated) {
     await redis.set(KEYS.PRODUCTS, JSON.stringify(products));
     broadcast({ type: "productsUpdate", products });
+    
+    // ★★★ 寫入歷史訂單 ★★★
+    const orderRecord = {
+      id: Date.now(), // 訂單編號
+      timestamp: Date.now(),
+      number: orderInfo.number,
+      name: orderInfo.clientName || '未具名',
+      items: checkoutItems,
+      total: orderInfo.totalAmount
+    };
+    // RPUSH 加到列表尾端
+    await redis.rpush(KEYS.HISTORY, JSON.stringify(orderRecord));
   }
 }
 
