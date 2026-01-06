@@ -329,7 +329,7 @@ async function getParsedSelections() {
   return parsed;
 }
 
-async function handleCheckout(checkoutItems) {
+async function handleCheckout(checkoutItems, orderInfo) {
   const productsRaw = await redis.get(KEYS.PRODUCTS);
   let products = productsRaw ? JSON.parse(productsRaw) : [];
   let isUpdated = false;
