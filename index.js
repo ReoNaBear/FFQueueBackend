@@ -43,6 +43,121 @@ app.post("/api/admin-login", (req, res) => {
   }
 });
 
+const requireAdmin = (req, res, next) => {
+  // 前端可以在 headers 帶 'x-admin-password' 或 body 帶 'password'
+  const password = req.headers['x-admin-password'] || req.body.password;
+  
+  if (password === ADMIN_PASSWORD) {
+    next();
+  } else {
+    res.status(401).json({ success: false, message: "權限不足：密碼錯誤" });
+  }
+};
+// 2. 設定時間/公告
+app.post("/api/admin/settings", requireAdmin, async (req, res) => {
+  try {
+    const { settings } = req.body;
+    await redis.set(KEYS.SETTINGS, JSON.stringify(settings));
+    broadcast({ type: "settingsUpdate", settings });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 3. 更新商品列表 (上架/修改)
+app.post("/api/admin/products", requireAdmin, async (req, res) => {
+  try {
+    const { products } = req.body;
+    console.log("API: 更新商品", products.length, "筆");
+    await redis.set(KEYS.PRODUCTS, JSON.stringify(products));
+    
+    // 通知所有前端更新畫面
+    broadcast({ type: "productsUpdate", products });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4. 叫號 (下一位)
+app.post("/api/admin/next", requireAdmin, async (req, res) => {
+  try {
+    const current = await redis.hincrby(KEYS.GLOBAL, "currentNumber", 1);
+    console.log("API: 叫號更新:", current);
+    
+    broadcast({ type: "nextUpdate", current });
+    res.json({ success: true, current });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 5. ★★★ 結帳 (核心功能) ★★★
+app.post("/api/admin/checkout", requireAdmin, async (req, res) => {
+  try {
+    const { checkoutItems, orderInfo } = req.body;
+    
+    // 呼叫邏輯處理函數
+    const result = await performCheckoutLogic(checkoutItems, orderInfo);
+    
+    if (result.success) {
+      // 只有成功時才廣播庫存變動
+      broadcast({ type: "productsUpdate", products: result.products });
+      res.json({ success: true, message: "結帳成功" });
+    } else {
+      // 失敗 (如庫存不足) 回傳 400
+      res.status(400).json({ success: false, message: result.message });
+    }
+  } catch (e) {
+    console.error("Checkout Error:", e);
+    res.status(500).json({ success: false, message: "伺服器錯誤" });
+  }
+});
+
+// 6. 重置隊伍 (危險操作)
+app.post("/api/admin/reset", requireAdmin, async (req, res) => {
+  try {
+    await handleResetQueue(); // 呼叫原本的邏輯
+    res.json({ success: true, message: "隊伍已重置" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 7. 取得預選名單 (GET)
+app.get("/api/admin/names", requireAdmin, async (req, res) => {
+  try {
+    const allNames = await redis.hgetall(KEYS.NAMES);
+    res.json({ success: true, names: allNames });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 8. 取得歷史訂單 (GET)
+app.get("/api/admin/history", requireAdmin, async (req, res) => {
+  try {
+    const historyRaw = await redis.lrange(KEYS.HISTORY, 0, -1);
+    const history = historyRaw.map(item => JSON.parse(item));
+    res.json({ success: true, history });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 9. 清除歷史訂單 (DELETE)
+app.delete("/api/admin/history", requireAdmin, async (req, res) => {
+  try {
+    await redis.del(KEYS.HISTORY);
+    // 通知前端(如果有在看歷史頁面的話)
+    // ws.send... 這裡可以選擇性廣播，或者前端重新整理就好
+    res.json({ success: true, message: "歷史紀錄已清除" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // --------------------
 // WebSocket 邏輯
 // --------------------
@@ -59,12 +174,6 @@ wss.on("connection", (ws) => {
       if (!clientId) return;
 
       switch (data.action) {
-        case "adminSetSettings":
-          await handleSetSettings(data.settings);
-          break;
-        case "adminResetQueue":
-          await handleResetQueue();
-          break;
         case "joinQueue":
           await handleJoinQueue(ws, clientId);
           break;
@@ -80,36 +189,11 @@ wss.on("connection", (ws) => {
         case "getInitialData":
           await sendInitialData(ws, clientId);
           break;
-        case "adminUpdateProducts":
-          console.log("收到更新商品請求:", data.products.length, "筆資料");
-          await redis.set(KEYS.PRODUCTS, JSON.stringify(data.products));
-          broadcast({ type: "productsUpdate", products: data.products });
-          break;
-        case "adminNext":
-          // 確保即使沒有值也能從 1 開始
-          const current = await redis.hincrby(KEYS.GLOBAL, "currentNumber", 1);
-          console.log("叫號更新:", current);
-          broadcast({ type: "nextUpdate", current });
-          break;
-        case "adminCheckout":
-          await handleCheckout(data.checkoutItems, data.orderInfo);
-          break;
         case "submitSelection":
           await handleSubmitSelection(ws, clientId, data.cart);
           break;
         case "updateName":
           await handleUpdateName(ws, clientId, data.name);
-          break;
-        case "getAdminNames":
-          const allNames = await redis.hgetall(KEYS.NAMES);
-          ws.send(JSON.stringify({ type: "adminNamesData", names: allNames }));
-          break;
-        case "getHistory":
-          await sendHistoryData(ws);
-          break;
-        case "clearHistory":
-          await redis.del(KEYS.HISTORY);
-          ws.send(JSON.stringify({ type: "historyCleared" }));
           break;
         default:
           console.log("未知指令:", data.action);
@@ -120,16 +204,15 @@ wss.on("connection", (ws) => {
   });
 });
 
-// --------------------
+async function getNames(ws, clientId) {
+  const allNames = await redis.hgetall(KEYS.NAMES);
+  ws.send(JSON.stringify({ type: "adminNamesData", names: allNames })); 
+}
+
+// --------
+// ------------
 // 邏輯處理函數
 // --------------------
-// 時間處理設定變更
-async function handleSetSettings(settings) {
-    // 儲存設定到 Redis
-    await redis.set(KEYS.SETTINGS, JSON.stringify(settings));
-    // 廣播給所有人更新設定 (Client 端需要知道時間變了)
-    broadcast({ type: "settingsUpdate", settings });
-}
 
 // 處理重置隊伍
 async function handleResetQueue() {
