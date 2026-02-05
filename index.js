@@ -213,29 +213,102 @@ async function getNames(ws, clientId) {
 // ------------
 // 邏輯處理函數
 // --------------------
+async function performCheckoutLogic(checkoutItems, orderInfo) {
+  const productsRaw = await redis.get(KEYS.PRODUCTS);
+  let products = productsRaw ? JSON.parse(productsRaw) : [];
+  let isUpdated = false;
+  let errorMessage = null;
 
-// 處理重置隊伍
-async function handleResetQueue() {
-    // 1. 清除全域計數器
-    await redis.del(KEYS.GLOBAL);
+  // 1. 檢查與扣庫存
+  for (const item of checkoutItems) {
+    const target = products.find(p => p.id === item.id);
     
-    // 2. 清除所有預選單
-    await redis.del(KEYS.SELECTIONS);
-    await redis.del(KEYS.NAMES);
-
-    // 3. 清除所有 Client 資料 (比較暴力的做法，但最乾淨)
-    // 取得所有 client key
-    const clientKeys = await redis.keys(`${KEYS.CLIENT_PREFIX}*`);
-    if (clientKeys.length > 0) {
-        await redis.del(...clientKeys);
+    // 如果是純「斗內」項目 (沒有 ID 或 ID 是特殊的)，不需要扣庫存
+    if (item.id === 'DONATE_999' || item.name === '斗內') {
+        continue; 
     }
 
-    // 4. 廣播「重置」訊號，叫所有前端清空自己
-    broadcast({ type: "forceReset" });
+    if (!target) {
+        // 如果找不到商品但又不是斗內，略過或報錯
+        continue;
+    }
+
+    // 庫存檢查
+    if (target.qty < item.checkoutQty) {
+        errorMessage = `庫存不足: ${target.name} (剩餘: ${target.qty})`;
+        break; // 中斷迴圈
+    }
+
+    // 執行扣庫存
+    if (target.content) {
+        // 組合商品邏輯
+        let ingredientsEnough = true;
+        // 檢查原料
+        for (const [subId, subQty] of Object.entries(target.content)) {
+            const subProduct = products.find(p => p.id == subId);
+            if (!subProduct || subProduct.qty < (item.checkoutQty * subQty)) {
+                ingredientsEnough = false;
+                errorMessage = `原料不足: ${subProduct ? subProduct.name : '未知原料'}`;
+                break;
+            }
+        }
+        if (!ingredientsEnough) break;
+
+        // 扣除
+        target.qty = Math.max(0, target.qty - item.checkoutQty);
+        Object.entries(target.content).forEach(([subId, subQty]) => {
+            const subProduct = products.find(p => p.id == subId);
+            subProduct.qty = Math.max(0, subProduct.qty - (item.checkoutQty * subQty));
+        });
+        isUpdated = true;
+
+    } else {
+        // 一般商品
+        target.qty = Math.max(0, target.qty - item.checkoutQty);
+        isUpdated = true;
+    }
+  }
+
+  // 2. 如果有錯誤，回傳失敗
+  if (errorMessage) {
+      return { success: false, message: errorMessage };
+  }
+
+  // 3. 如果有更新，寫入 Redis 並記錄歷史
+  if (isUpdated || checkoutItems.some(i => i.name === '斗內')) {
+    // 即使只有斗內沒有扣庫存，也可能需要記錄歷史，這裡假設有扣庫存才更新 Redis Products
+    if (isUpdated) {
+        await redis.set(KEYS.PRODUCTS, JSON.stringify(products));
+    }
+
+    // 寫入歷史訂單
+    const orderRecord = {
+      id: Date.now(),
+      timestamp: Date.now(),
+      number: orderInfo.number,
+      name: orderInfo.clientName || '未具名',
+      items: checkoutItems,
+      total: orderInfo.totalAmount
+    };
+    await redis.rpush(KEYS.HISTORY, JSON.stringify(orderRecord));
     
-    // 5. 廣播最新的隊伍狀態 (歸零)
-    broadcast({ type: "queueUpdate", queueCount: 0 });
-    broadcast({ type: "nextUpdate", current: 0 });
+    // 回傳成功與新的商品狀態
+    return { success: true, products };
+  }
+
+  return { success: true, products }; // 沒有變動也算成功
+}
+
+async function handleResetQueue() {
+  await redis.del(KEYS.GLOBAL);
+  await redis.del(KEYS.SELECTIONS);
+  await redis.del(KEYS.NAMES);
+  const clientKeys = await redis.keys(`${KEYS.CLIENT_PREFIX}*`);
+  if (clientKeys.length > 0) await redis.del(...clientKeys);
+
+  broadcast({ type: "forceReset" });
+  broadcast({ type: "queueUpdate", queueCount: 0 });
+  broadcast({ type: "nextUpdate", current: 0 });
 }
 
 async function handleUpdateName(ws, clientId, name) {
